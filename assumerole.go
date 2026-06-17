@@ -31,9 +31,13 @@ type cachedCreds struct {
 	expiry time.Time
 }
 
-// roleCache caches AssumeRole results per role ARN. The temporary
-// credentials are account-scoped (not connection-scoped), so the cache is
-// process-wide and shared across agent connections.
+// roleCache caches AssumeRole results per (role ARN, session name). The
+// temporary credentials are account-scoped (not connection-scoped), so the
+// cache is process-wide and shared across agent connections. The session name
+// is part of the key so credentials minted for one session (e.g. the
+// Organizations resolver's "clawpatrol-orgresolve") are never reused for a
+// different session's calls — otherwise CloudTrail would misattribute the
+// caller for any account both sessions touch.
 type roleCache struct {
 	mu sync.Mutex
 	m  map[string]cachedCreds
@@ -41,28 +45,30 @@ type roleCache struct {
 
 var assumed = &roleCache{m: map[string]cachedCreds{}}
 
-func (c *roleCache) get(arn string) (aws.Credentials, bool) {
+func (c *roleCache) get(key string) (aws.Credentials, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	v, ok := c.m[arn]
+	v, ok := c.m[key]
 	if !ok || !time.Now().Before(v.expiry.Add(-assumeRoleSkew)) {
 		return aws.Credentials{}, false
 	}
 	return v.creds, true
 }
 
-func (c *roleCache) put(arn string, creds aws.Credentials, expiry time.Time) {
+func (c *roleCache) put(key string, creds aws.Credentials, expiry time.Time) {
 	c.mu.Lock()
-	c.m[arn] = cachedCreds{creds: creds, expiry: expiry}
+	c.m[key] = cachedCreds{creds: creds, expiry: expiry}
 	c.mu.Unlock()
 }
 
 // assumeRole returns temporary credentials for the role in accountID,
 // assuming it with the base credentials via STS over the connection's
-// brokered dial. Results are cached until shortly before expiry.
+// brokered dial. Results are cached per (role, session name) until shortly
+// before expiry.
 func assumeRole(ctx context.Context, conn *pluginsdk.Conn, base aws.Credentials, accountID, role, sessionName string) (aws.Credentials, error) {
 	arn := fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, role)
-	if c, ok := assumed.get(arn); ok {
+	cacheKey := arn + "\x00" + sessionName
+	if c, ok := assumed.get(cacheKey); ok {
 		return c, nil
 	}
 
@@ -87,7 +93,7 @@ func assumeRole(ctx context.Context, conn *pluginsdk.Conn, base aws.Credentials,
 	if out.Credentials.Expiration != nil {
 		expiry = *out.Credentials.Expiration
 	}
-	assumed.put(arn, creds, expiry)
+	assumed.put(cacheKey, creds, expiry)
 	return creds, nil
 }
 

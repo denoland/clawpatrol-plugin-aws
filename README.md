@@ -10,11 +10,17 @@ with SigV4, and forwards to AWS through the gateway's brokered dial.
 ## What it provides
 
 - **Facet `aws`** — the rule vocabulary: `aws.service`, `aws.action`,
-  `aws.account`, `aws.region`, `aws.resource`, `aws.method`.
+  `aws.account`, `aws.account_name`, `aws.region`, `aws.resource`,
+  `aws.method`. `aws.account_name` is the operator-configured label for
+  the target account (see the endpoint's `accounts` below); it also leads
+  the human approval prompt so reviewers read "in account dev" instead of
+  a bare number.
 - **Endpoint `aws_api`** — terminates TLS, evaluates the parsed action,
   assumes the per-account role, re-signs, and brokered-dials AWS. Runs
   with **no network of its own** (`network = none`); both the API call
   and the STS `AssumeRole` go through the gateway's audited brokered dial.
+  Optional `accounts = ["<account-id>=<name>", ...]` names accounts for
+  `aws.account_name` and the approval prompt.
 - **Credential `aws_account`** — the single **base key** (access key id /
   secret access key / optional session token) used to assume each
   account's role.
@@ -58,6 +64,10 @@ endpoint "aws_api" "avocet2" {
   role       = "clawpatrol-gateway"  # role assumed in each account
   region     = "us-east-1"
   credential = aws_account.base
+  accounts = [                       # optional id -> name labels
+    "111111111111=prod",
+    "222222222222=staging",
+  ]
 }
 
 # Broad reads allowed; mutations need human approval; secrets denied.

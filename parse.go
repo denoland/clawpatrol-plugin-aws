@@ -2,12 +2,21 @@ package main
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
 // parseServiceRegion derives the AWS service and region from the host,
 // e.g. "dynamodb.us-east-1.amazonaws.com" -> ("dynamodb", "us-east-1"),
 // "s3.amazonaws.com" -> ("s3", "").
+//
+// The region, when present, is the last label before ".amazonaws.com"
+// (us-east-1); the service is the label just before it. When the last
+// label isn't a region the service is that last label itself (iam, s3).
+// Anchoring on the region label this way means virtual-host-style S3
+// ("<bucket>.s3.<region>.amazonaws.com", or "<bucket>.s3.amazonaws.com")
+// resolves to service "s3" rather than the bucket name — getting the
+// service wrong breaks the SigV4 re-signing (AuthorizationHeaderMalformed).
 func parseServiceRegion(host string) (service, region string) {
 	host = strings.ToLower(host)
 	const suffix = ".amazonaws.com"
@@ -15,25 +24,108 @@ func parseServiceRegion(host string) (service, region string) {
 		return "", ""
 	}
 	labels := strings.Split(strings.TrimSuffix(host, suffix), ".")
-	if len(labels) == 0 || labels[0] == "" {
+	i := len(labels) - 1
+	if i < 0 || labels[i] == "" {
 		return "", ""
 	}
-	service = labels[0]
-	if len(labels) >= 2 && looksLikeRegion(labels[1]) {
-		region = labels[1]
+	// Region is the last label when it's a region code (us-east-1).
+	if looksLikeRegion(labels[i]) {
+		region = labels[i]
+		i--
+	}
+	// Skip addressing qualifiers between the service and region labels
+	// (dualstack / fips), e.g. "<bucket>.s3.dualstack.<region>" — they're
+	// not the service.
+	for i >= 0 && isAddressingQualifier(labels[i]) {
+		i--
+	}
+	if i < 0 {
+		return "", region
+	}
+	service = labels[i]
+	service, region = normalizeS3Endpoint(service, region)
+	return service, region
+}
+
+func isAddressingQualifier(label string) bool {
+	return label == "dualstack" || label == "fips"
+}
+
+// normalizeS3Endpoint maps the S3 endpoint host variants to the "s3" SigV4
+// signing name and recovers the region from the legacy host forms. Plain S3
+// — virtual-host, FIPS, access-point, object-lambda, the legacy dash-region
+// and "s3-external-1" aliases — all sign under service name "s3". S3 Control
+// keeps its own signing name. The S3 global endpoint signs in us-east-1.
+func normalizeS3Endpoint(service, region string) (string, string) {
+	switch service {
+	case "s3", "s3-accesspoint", "s3-fips", "s3-object-lambda":
+		service = "s3"
+	case "s3-external-1":
+		service, region = "s3", "us-east-1"
+	default:
+		// Legacy "s3-<region>" dash form, only when the suffix really is a
+		// region (so s3-control and similar fall through untouched).
+		if region == "" && strings.HasPrefix(service, "s3-") {
+			if cand := service[len("s3-"):]; looksLikeRegion(cand) {
+				service, region = "s3", cand
+			}
+		}
+	}
+	if service == "s3" && region == "" {
+		region = "us-east-1"
 	}
 	return service, region
 }
 
-func looksLikeRegion(s string) bool {
-	// e.g. us-east-1, eu-west-2, ap-southeast-1.
-	return strings.Count(s, "-") >= 2
+// looksLikeRegion reports whether label is an AWS region code such as
+// us-east-1, eu-west-2, ap-southeast-1, or us-gov-west-1: a 2-letter geo
+// prefix and a numeric suffix, at least three dash-separated parts. The
+// geo-prefix check keeps service labels that merely contain dashes
+// (execute-api) or an "s3-<region>" endpoint label from being mistaken
+// for a region.
+func looksLikeRegion(label string) bool {
+	parts := strings.Split(label, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	if len(parts[0]) != 2 || !isLowerLetters(parts[0]) {
+		return false
+	}
+	return isDigits(parts[len(parts)-1])
+}
+
+func isLowerLetters(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseAction extracts the operation name. JSON-protocol services carry it
 // in X-Amz-Target ("DynamoDB_20120810.PutItem" -> "PutItem"); query
-// services in an Action parameter; otherwise it falls back to METHOD path.
-func parseAction(req *http.Request) string {
+// services in an Action parameter — in the URL query for GET requests, or
+// in the form-encoded body for POST requests (ec2, iam, sts, autoscaling,
+// rds, cloudformation, sqs, sns, ...); otherwise it falls back to METHOD
+// path (S3-style REST: "DELETE /bucket/key"). body is the already-read
+// request body.
+func parseAction(req *http.Request, body []byte) string {
 	if t := req.Header.Get("X-Amz-Target"); t != "" {
 		if i := strings.LastIndex(t, "."); i >= 0 {
 			return t[i+1:]
@@ -43,7 +135,26 @@ func parseAction(req *http.Request) string {
 	if a := req.URL.Query().Get("Action"); a != "" {
 		return a
 	}
+	if a := formAction(req, body); a != "" {
+		return a
+	}
 	return req.Method + " " + req.URL.Path
+}
+
+// formAction returns the Action parameter from a query-protocol request's
+// form-encoded body, or "" when the request isn't form-encoded or carries
+// no Action. AWS query-protocol services POST
+// "Action=DescribeRegions&Version=..." as application/x-www-form-urlencoded.
+func formAction(req *http.Request, body []byte) string {
+	ct := req.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
+		return ""
+	}
+	vals, err := url.ParseQuery(string(body))
+	if err != nil {
+		return ""
+	}
+	return vals.Get("Action")
 }
 
 // accessKeyFromAuthorization pulls the access key id out of a SigV4

@@ -8,12 +8,33 @@ import (
 
 func TestParseServiceRegion(t *testing.T) {
 	cases := []struct{ host, service, region string }{
-		{"s3.amazonaws.com", "s3", ""},
+		// S3 global signs in us-east-1.
+		{"s3.amazonaws.com", "s3", "us-east-1"},
+		{"my-bucket.s3.amazonaws.com", "s3", "us-east-1"},
 		{"s3.us-west-2.amazonaws.com", "s3", "us-west-2"},
 		{"dynamodb.us-east-1.amazonaws.com", "dynamodb", "us-east-1"},
 		{"execute-api.eu-west-1.amazonaws.com", "execute-api", "eu-west-1"},
 		{"iam.amazonaws.com", "iam", ""},
 		{"DynamoDB.US-East-1.amazonaws.com", "dynamodb", "us-east-1"}, // case-folded
+		// Virtual-host-style S3: service is "s3", not the bucket name.
+		{"my-bucket.s3.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"clawpatrol-avocet2-test-820178564529.s3.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"dotted.bucket.name.s3.us-west-2.amazonaws.com", "s3", "us-west-2"},
+		// Dualstack / FIPS qualifiers sit between service and region.
+		{"s3.dualstack.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"my-bucket.s3.dualstack.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"s3-fips.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		// Access points / object lambda sign as "s3".
+		{"my-ap.s3-accesspoint.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"my-ol.s3-object-lambda.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		// Legacy dash-region + the s3-external-1 us-east-1 alias.
+		{"s3-us-west-2.amazonaws.com", "s3", "us-west-2"},
+		{"my-bucket.s3-eu-west-1.amazonaws.com", "s3", "eu-west-1"},
+		{"s3-external-1.amazonaws.com", "s3", "us-east-1"},
+		// S3 Control keeps its own signing name.
+		{"s3-control.us-east-1.amazonaws.com", "s3-control", "us-east-1"},
+		// GovCloud region (4 parts).
+		{"sts.us-gov-west-1.amazonaws.com", "sts", "us-gov-west-1"},
 		{"example.com", "", ""},
 	}
 	for _, c := range cases {
@@ -25,25 +46,34 @@ func TestParseServiceRegion(t *testing.T) {
 }
 
 func TestParseAction(t *testing.T) {
-	mk := func(target, rawquery, method, path string) *http.Request {
+	const formCT = "application/x-www-form-urlencoded"
+	mk := func(target, rawquery, method, path, contentType string) *http.Request {
 		r := &http.Request{Method: method, Header: http.Header{}, URL: &url.URL{Path: path, RawQuery: rawquery}}
 		if target != "" {
 			r.Header.Set("X-Amz-Target", target)
+		}
+		if contentType != "" {
+			r.Header.Set("Content-Type", contentType)
 		}
 		return r
 	}
 	cases := []struct {
 		name string
 		req  *http.Request
+		body string
 		want string
 	}{
-		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/"), "PutItem"},
-		{"target no dot", mk("Discovery", "", "POST", "/"), "Discovery"},
-		{"query action", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/"), "DescribeInstances"},
-		{"s3 fallback", mk("", "", "DELETE", "/bucket/key"), "DELETE /bucket/key"},
+		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", ""), "", "PutItem"},
+		{"target no dot", mk("Discovery", "", "POST", "/", ""), "", "Discovery"},
+		{"query action in url", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/", ""), "", "DescribeInstances"},
+		{"query action in form body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Version=2016-11-15", "DescribeRegions"},
+		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "DescribeVpcs"},
+		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "POST /"},
+		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "POST /path"},
+		{"s3 fallback", mk("", "", "DELETE", "/bucket/key", ""), "", "DELETE /bucket/key"},
 	}
 	for _, c := range cases {
-		if got := parseAction(c.req); got != c.want {
+		if got := parseAction(c.req, []byte(c.body)); got != c.want {
 			t.Errorf("%s: parseAction = %q, want %q", c.name, got, c.want)
 		}
 	}

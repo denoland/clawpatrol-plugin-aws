@@ -17,6 +17,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -98,6 +99,11 @@ type endpointConfig struct {
 	Region string `json:"region"`
 }
 
+// maxRequestBody bounds how much of a request body the plugin buffers in
+// memory to re-sign it. Larger objects need multipart/streaming uploads,
+// which aren't supported yet.
+const maxRequestBody = 256 << 20 // 256 MiB
+
 func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	var cfg endpointConfig
 	_ = json.Unmarshal(conn.EndpointCanonicalConfig, &cfg)
@@ -107,6 +113,15 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	if err != nil {
 		return fmt.Errorf("read request: %w", err)
 	}
+	// Honor Expect: 100-continue before reading the body. Uploads (S3
+	// PutObject and friends) send the request headers with
+	// "Expect: 100-continue" and wait for an interim 100 response before
+	// streaming the body. http.ReadRequest doesn't emit that for us, so
+	// without it the io.ReadAll(req.Body) below deadlocks against the
+	// waiting client and the connection eventually closes with no response.
+	if expectsContinue(req.Header.Get("Expect")) {
+		_, _ = conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
+	}
 	host := req.Host
 	if host == "" {
 		host = conn.UpstreamHost
@@ -115,14 +130,54 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	if region == "" {
 		region = cfg.Region
 	}
-	action := parseAction(req)
-	account := accountFromAuthorization(req.Header.Get("Authorization"))
 
-	body, err := io.ReadAll(req.Body)
+	// Read the body before parsing the action: query-protocol services
+	// (ec2, iam, sts, autoscaling, rds, cloudformation, sqs, sns, ...) put
+	// the operation name in the form-encoded body of a POST, so parseAction
+	// needs it to avoid classifying every such call as "POST /".
+	//
+	// The whole body is buffered because re-signing needs the payload hash;
+	// cap it so a multi-GiB upload can't OOM the gateway. Larger objects
+	// need multipart/streaming, which isn't supported yet.
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxRequestBody+1))
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
 	}
 	_ = req.Body.Close()
+	if int64(len(body)) > maxRequestBody {
+		return writeStatus(conn, http.StatusRequestEntityTooLarge,
+			"clawpatrol: request body exceeds the gateway buffer limit; large object uploads are not yet supported")
+	}
+
+	// S3 uploads stream the body in aws-chunked content-encoding — each
+	// chunk length-prefixed, with a per-chunk signature tied to the agent's
+	// original SigV4 seed (or an unsigned-trailer variant). We re-sign as a
+	// plain payload, so decode the framing back to the raw content and drop
+	// the chunked headers; otherwise the body S3 receives doesn't match the
+	// hash/length we sign (SignatureDoesNotMatch).
+	if isAWSChunked(req.Header) {
+		decoded, derr := decodeAWSChunked(body)
+		if derr != nil {
+			return fmt.Errorf("decode aws-chunked body: %w", derr)
+		}
+		body = decoded
+		req.Header.Del("Content-Encoding")
+		req.Header.Del("X-Amz-Decoded-Content-Length")
+		req.Header.Del("X-Amz-Trailer")
+		// The trailing chunk carried the agent's checksum, which we drop with
+		// the framing. Remove the checksum-declaring headers too so the
+		// re-signed plain PutObject doesn't promise a checksum we won't send.
+		req.Header.Del("X-Amz-Sdk-Checksum-Algorithm")
+		for _, k := range headerKeys(req.Header) {
+			if strings.HasPrefix(strings.ToLower(k), "x-amz-checksum-") {
+				req.Header.Del(k)
+			}
+		}
+		req.ContentLength = int64(len(body))
+	}
+
+	action := parseAction(req, body)
+	account := accountFromAuthorization(req.Header.Get("Authorization"))
 
 	if account == "" {
 		return writeStatus(conn, http.StatusForbidden,
@@ -137,7 +192,7 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 		"region":   region,
 		"resource": req.URL.Path,
 		"method":   req.Method,
-	}, fmt.Sprintf("%s %s:%s in %s", req.Method, service, action, account))
+	}, approvalSummary(req, service, action, region, account, host))
 	if err != nil {
 		return fmt.Errorf("evaluate: %w", err)
 	}
@@ -175,19 +230,85 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	return resp.Write(conn)
 }
 
+// expectsContinue reports whether the Expect header requests a 100-continue
+// interim response (case-insensitive, per RFC 7231).
+func expectsContinue(expect string) bool {
+	return strings.EqualFold(strings.TrimSpace(expect), "100-continue")
+}
+
+// approvalSummary builds the human-facing one-line description of an AWS
+// operation for the HITL approval prompt. It surfaces the method, the full
+// resource (host + path, so the bucket/key or API host is visible), the
+// region, and the account — and the parsed operation name for query/JSON
+// services (ec2 TerminateInstances, etc.) where the method+path alone
+// ("POST /") says nothing. REST services (S3) omit the redundant operation
+// name since it's just "METHOD path".
+func approvalSummary(req *http.Request, service, action, region, account, host string) string {
+	resource := host + req.URL.Path
+	op := ""
+	if action != "" && action != req.Method+" "+req.URL.Path {
+		op = " [" + action + "]"
+	}
+	where := account
+	if region != "" {
+		where = account + " " + region
+	}
+	return fmt.Sprintf("%s %s %s%s in account %s", req.Method, service, resource, op, where)
+}
+
+// signRequest replaces *req with a freshly built upstream request for host,
+// carrying body and only the operation-relevant headers, signed with creds.
+//
+// Re-signing the agent's own *http.Request in place is fragile: it arrives
+// via http.ReadRequest carrying transport/streaming headers (Expect,
+// Accept-Encoding, aws-chunked framing, the agent's placeholder
+// Authorization/x-amz-content-sha256) and parser state that make SignHTTP
+// cover header values the subsequent req.Write serializes differently —
+// S3 then rejects with SignatureDoesNotMatch. Building a clean request and
+// copying only the headers that are part of the S3 operation keeps the
+// signed canonical request and the bytes on the wire identical.
 func signRequest(ctx context.Context, req *http.Request, host string, body []byte, service, region string, creds aws.Credentials) error {
-	req.URL.Scheme = "https"
-	req.URL.Host = host
-	req.RequestURI = ""
-	req.Body = io.NopCloser(strings.NewReader(string(body)))
-	req.ContentLength = int64(len(body))
-	// The agent signed with its placeholder; drop those so the re-sign is
-	// clean.
-	req.Header.Del("Authorization")
-	req.Header.Del("X-Amz-Security-Token")
+	out, err := http.NewRequestWithContext(ctx, req.Method, "https://"+host+req.URL.RequestURI(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	out.ContentLength = int64(len(body))
+	for k, vs := range req.Header {
+		if signerControlledHeader(k) {
+			continue
+		}
+		out.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
+	}
 
 	sum := sha256.Sum256(body)
-	return v4.NewSigner().SignHTTP(ctx, creds, req, hex.EncodeToString(sum[:]), service, region, time.Now())
+	hash := hex.EncodeToString(sum[:])
+	out.Header.Set("X-Amz-Content-Sha256", hash)
+	if err := v4.NewSigner().SignHTTP(ctx, creds, out, hash, service, region, time.Now()); err != nil {
+		return err
+	}
+	*req = *out
+	return nil
+}
+
+// signerControlledHeader reports whether a request header is one the gateway
+// owns and must not copy verbatim from the agent: SigV4 auth/identity and
+// payload-hash headers that the re-sign recomputes, content-length and host
+// that come from the request fields, and hop-by-hop transport headers. Every
+// other header (Content-Type, Range, conditional, SSE, copy-source, ACL
+// grants, x-amz-meta-*, checksums, ...) is part of the operation's semantics
+// and is forwarded and signed as sent — an allow-list would silently drop
+// operation-affecting headers (wrong bytes from a Range GET, an object stored
+// unencrypted when SSE headers vanish, a broken CopyObject).
+func signerControlledHeader(k string) bool {
+	switch strings.ToLower(k) {
+	case "authorization", "x-amz-date", "x-amz-security-token",
+		"x-amz-content-sha256", "content-length", "host", "expect",
+		"user-agent", "accept-encoding",
+		"connection", "proxy-connection", "keep-alive",
+		"transfer-encoding", "te", "trailer", "upgrade":
+		return true
+	}
+	return false
 }
 
 func allowed(action string) bool {

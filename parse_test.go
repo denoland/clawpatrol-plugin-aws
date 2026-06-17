@@ -8,7 +8,9 @@ import (
 
 func TestParseServiceRegion(t *testing.T) {
 	cases := []struct{ host, service, region string }{
-		{"s3.amazonaws.com", "s3", ""},
+		// S3 global signs in us-east-1.
+		{"s3.amazonaws.com", "s3", "us-east-1"},
+		{"my-bucket.s3.amazonaws.com", "s3", "us-east-1"},
 		{"s3.us-west-2.amazonaws.com", "s3", "us-west-2"},
 		{"dynamodb.us-east-1.amazonaws.com", "dynamodb", "us-east-1"},
 		{"execute-api.eu-west-1.amazonaws.com", "execute-api", "eu-west-1"},
@@ -16,12 +18,21 @@ func TestParseServiceRegion(t *testing.T) {
 		{"DynamoDB.US-East-1.amazonaws.com", "dynamodb", "us-east-1"}, // case-folded
 		// Virtual-host-style S3: service is "s3", not the bucket name.
 		{"my-bucket.s3.us-east-1.amazonaws.com", "s3", "us-east-1"},
-		{"my-bucket.s3.amazonaws.com", "s3", ""},
 		{"clawpatrol-avocet2-test-820178564529.s3.us-east-1.amazonaws.com", "s3", "us-east-1"},
 		{"dotted.bucket.name.s3.us-west-2.amazonaws.com", "s3", "us-west-2"},
-		// Legacy dash-region S3.
+		// Dualstack / FIPS qualifiers sit between service and region.
+		{"s3.dualstack.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"my-bucket.s3.dualstack.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"s3-fips.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		// Access points / object lambda sign as "s3".
+		{"my-ap.s3-accesspoint.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		{"my-ol.s3-object-lambda.us-east-1.amazonaws.com", "s3", "us-east-1"},
+		// Legacy dash-region + the s3-external-1 us-east-1 alias.
 		{"s3-us-west-2.amazonaws.com", "s3", "us-west-2"},
 		{"my-bucket.s3-eu-west-1.amazonaws.com", "s3", "eu-west-1"},
+		{"s3-external-1.amazonaws.com", "s3", "us-east-1"},
+		// S3 Control keeps its own signing name.
+		{"s3-control.us-east-1.amazonaws.com", "s3-control", "us-east-1"},
 		// GovCloud region (4 parts).
 		{"sts.us-gov-west-1.amazonaws.com", "sts", "us-gov-west-1"},
 		{"example.com", "", ""},

@@ -24,23 +24,55 @@ func parseServiceRegion(host string) (service, region string) {
 		return "", ""
 	}
 	labels := strings.Split(strings.TrimSuffix(host, suffix), ".")
-	n := len(labels)
-	if n == 0 || labels[n-1] == "" {
+	i := len(labels) - 1
+	if i < 0 || labels[i] == "" {
 		return "", ""
 	}
-	if looksLikeRegion(labels[n-1]) {
-		region = labels[n-1]
-		if n >= 2 {
-			service = labels[n-2]
-		}
-	} else {
-		service = labels[n-1]
+	// Region is the last label when it's a region code (us-east-1).
+	if looksLikeRegion(labels[i]) {
+		region = labels[i]
+		i--
 	}
-	// Legacy dash-region S3 endpoints: "s3-us-west-2" -> service "s3",
-	// region "us-west-2" (also "<bucket>.s3-us-west-2.amazonaws.com").
-	if region == "" && strings.HasPrefix(service, "s3-") {
-		region = strings.TrimPrefix(service, "s3-")
+	// Skip addressing qualifiers between the service and region labels
+	// (dualstack / fips), e.g. "<bucket>.s3.dualstack.<region>" — they're
+	// not the service.
+	for i >= 0 && isAddressingQualifier(labels[i]) {
+		i--
+	}
+	if i < 0 {
+		return "", region
+	}
+	service = labels[i]
+	service, region = normalizeS3Endpoint(service, region)
+	return service, region
+}
+
+func isAddressingQualifier(label string) bool {
+	return label == "dualstack" || label == "fips"
+}
+
+// normalizeS3Endpoint maps the S3 endpoint host variants to the "s3" SigV4
+// signing name and recovers the region from the legacy host forms. Plain S3
+// — virtual-host, FIPS, access-point, object-lambda, the legacy dash-region
+// and "s3-external-1" aliases — all sign under service name "s3". S3 Control
+// keeps its own signing name. The S3 global endpoint signs in us-east-1.
+func normalizeS3Endpoint(service, region string) (string, string) {
+	switch service {
+	case "s3", "s3-accesspoint", "s3-fips", "s3-object-lambda":
 		service = "s3"
+	case "s3-external-1":
+		service, region = "s3", "us-east-1"
+	default:
+		// Legacy "s3-<region>" dash form, only when the suffix really is a
+		// region (so s3-control and similar fall through untouched).
+		if region == "" && strings.HasPrefix(service, "s3-") {
+			if cand := service[len("s3-"):]; looksLikeRegion(cand) {
+				service, region = "s3", cand
+			}
+		}
+	}
+	if service == "s3" && region == "" {
+		region = "us-east-1"
 	}
 	return service, region
 }

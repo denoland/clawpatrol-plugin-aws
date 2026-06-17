@@ -99,6 +99,11 @@ type endpointConfig struct {
 	Region string `json:"region"`
 }
 
+// maxRequestBody bounds how much of a request body the plugin buffers in
+// memory to re-sign it. Larger objects need multipart/streaming uploads,
+// which aren't supported yet.
+const maxRequestBody = 256 << 20 // 256 MiB
+
 func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	var cfg endpointConfig
 	_ = json.Unmarshal(conn.EndpointCanonicalConfig, &cfg)
@@ -130,11 +135,19 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 	// (ec2, iam, sts, autoscaling, rds, cloudformation, sqs, sns, ...) put
 	// the operation name in the form-encoded body of a POST, so parseAction
 	// needs it to avoid classifying every such call as "POST /".
-	body, err := io.ReadAll(req.Body)
+	//
+	// The whole body is buffered because re-signing needs the payload hash;
+	// cap it so a multi-GiB upload can't OOM the gateway. Larger objects
+	// need multipart/streaming, which isn't supported yet.
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxRequestBody+1))
 	if err != nil {
 		return fmt.Errorf("read body: %w", err)
 	}
 	_ = req.Body.Close()
+	if int64(len(body)) > maxRequestBody {
+		return writeStatus(conn, http.StatusRequestEntityTooLarge,
+			"clawpatrol: request body exceeds the gateway buffer limit; large object uploads are not yet supported")
+	}
 
 	// S3 uploads stream the body in aws-chunked content-encoding — each
 	// chunk length-prefixed, with a per-chunk signature tied to the agent's
@@ -261,9 +274,10 @@ func signRequest(ctx context.Context, req *http.Request, host string, body []byt
 	}
 	out.ContentLength = int64(len(body))
 	for k, vs := range req.Header {
-		if forwardableUpstreamHeader(k) {
-			out.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
+		if signerControlledHeader(k) {
+			continue
 		}
+		out.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), vs...)
 	}
 
 	sum := sha256.Sum256(body)
@@ -276,21 +290,25 @@ func signRequest(ctx context.Context, req *http.Request, host string, body []byt
 	return nil
 }
 
-// forwardableUpstreamHeader reports whether a request header from the agent
-// is part of the S3 operation's semantics and should be carried (and signed)
-// to the upstream. Transport, auth, encoding-framing, and content-hash
-// headers are deliberately excluded — the gateway sets those itself.
-func forwardableUpstreamHeader(k string) bool {
+// signerControlledHeader reports whether a request header is one the gateway
+// owns and must not copy verbatim from the agent: SigV4 auth/identity and
+// payload-hash headers that the re-sign recomputes, content-length and host
+// that come from the request fields, and hop-by-hop transport headers. Every
+// other header (Content-Type, Range, conditional, SSE, copy-source, ACL
+// grants, x-amz-meta-*, checksums, ...) is part of the operation's semantics
+// and is forwarded and signed as sent — an allow-list would silently drop
+// operation-affecting headers (wrong bytes from a Range GET, an object stored
+// unencrypted when SSE headers vanish, a broken CopyObject).
+func signerControlledHeader(k string) bool {
 	switch strings.ToLower(k) {
-	case "content-type", "content-md5", "content-language", "content-disposition",
-		"cache-control", "expires",
-		"x-amz-acl", "x-amz-storage-class", "x-amz-tagging",
-		"x-amz-website-redirect-location",
-		"x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
-		"x-amz-object-lock-legal-hold":
+	case "authorization", "x-amz-date", "x-amz-security-token",
+		"x-amz-content-sha256", "content-length", "host", "expect",
+		"user-agent", "accept-encoding",
+		"connection", "proxy-connection", "keep-alive",
+		"transfer-encoding", "te", "trailer", "upgrade":
 		return true
 	}
-	return strings.HasPrefix(strings.ToLower(k), "x-amz-meta-")
+	return false
 }
 
 func allowed(action string) bool {

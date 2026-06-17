@@ -36,7 +36,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.1.1",
+		Version: "0.1.2",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -196,7 +196,7 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 		req.ContentLength = int64(len(body))
 	}
 
-	action := parseAction(req, body)
+	action := parseAction(req, body, service)
 	account := accountFromAuthorization(req.Header.Get("Authorization"))
 
 	if account == "" {

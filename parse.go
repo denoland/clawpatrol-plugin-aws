@@ -122,10 +122,12 @@ func isDigits(s string) bool {
 // in X-Amz-Target ("DynamoDB_20120810.PutItem" -> "PutItem"); query
 // services in an Action parameter — in the URL query for GET requests, or
 // in the form-encoded body for POST requests (ec2, iam, sts, autoscaling,
-// rds, cloudformation, sqs, sns, ...); otherwise it falls back to METHOD
-// path (S3-style REST: "DELETE /bucket/key"). body is the already-read
-// request body.
-func parseAction(req *http.Request, body []byte) string {
+// rds, cloudformation, sqs, sns, ...); REST-JSON services (savingsplans,
+// ...) name the operation as the request path ("POST /DescribeSavingsPlans");
+// otherwise it falls back to METHOD path (S3-style REST: "DELETE
+// /bucket/key"). body is the already-read request body; service is the
+// SigV4 signing name from the host.
+func parseAction(req *http.Request, body []byte, service string) string {
 	if t := req.Header.Get("X-Amz-Target"); t != "" {
 		if i := strings.LastIndex(t, "."); i >= 0 {
 			return t[i+1:]
@@ -138,7 +140,53 @@ func parseAction(req *http.Request, body []byte) string {
 	if a := formAction(req, body); a != "" {
 		return a
 	}
+	if op := restJSONPathOperation(service, req.URL.Path); op != "" {
+		return op
+	}
 	return req.Method + " " + req.URL.Path
+}
+
+// restJSONPathOperation recovers the operation name of an AWS REST-JSON
+// service (e.g. savingsplans) that encodes it as a single CamelCase path
+// segment: "POST /DescribeSavingsPlans" -> "DescribeSavingsPlans". Without
+// this such reads classify as "POST /<Op>", which matches no read prefix and
+// falls to the mutation/approval branch.
+//
+// It is deliberately narrow. S3 is excluded: its path segments are arbitrary
+// bucket/object keys that an attacker could name "DescribeFoo" to forge a
+// read verdict on a write — S3 reads are already allowed by HTTP method, not
+// action, so nothing is lost. The lone-CamelCase-segment shape is unique to
+// operation-as-path services; resource-path REST services (lambda, route53,
+// apigateway) use lowercase or versioned multi-segment paths and never match.
+func restJSONPathOperation(service, path string) string {
+	switch service {
+	case "s3", "s3-control", "s3-outposts":
+		return ""
+	}
+	seg := strings.Trim(path, "/")
+	if seg == "" || strings.ContainsRune(seg, '/') {
+		return ""
+	}
+	if !isOperationName(seg) {
+		return ""
+	}
+	return seg
+}
+
+// isOperationName reports whether s has the shape of an AWS operation name:
+// an uppercase initial followed by ASCII letters/digits only (CamelCase, no
+// separators), e.g. "DescribeSavingsPlans".
+func isOperationName(s string) bool {
+	if s == "" || s[0] < 'A' || s[0] > 'Z' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 // formAction returns the Action parameter from a query-protocol request's

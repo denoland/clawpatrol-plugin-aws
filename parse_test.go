@@ -58,22 +58,32 @@ func TestParseAction(t *testing.T) {
 		return r
 	}
 	cases := []struct {
-		name string
-		req  *http.Request
-		body string
-		want string
+		name    string
+		req     *http.Request
+		body    string
+		service string
+		want    string
 	}{
-		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", ""), "", "PutItem"},
-		{"target no dot", mk("Discovery", "", "POST", "/", ""), "", "Discovery"},
-		{"query action in url", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/", ""), "", "DescribeInstances"},
-		{"query action in form body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Version=2016-11-15", "DescribeRegions"},
-		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "DescribeVpcs"},
-		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "POST /"},
-		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "POST /path"},
-		{"s3 fallback", mk("", "", "DELETE", "/bucket/key", ""), "", "DELETE /bucket/key"},
+		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", ""), "", "dynamodb", "PutItem"},
+		{"target no dot", mk("Discovery", "", "POST", "/", ""), "", "discovery", "Discovery"},
+		{"query action in url", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/", ""), "", "ec2", "DescribeInstances"},
+		{"query action in form body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Version=2016-11-15", "ec2", "DescribeRegions"},
+		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "ec2", "DescribeVpcs"},
+		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "ec2", "POST /"},
+		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "lambda", "POST /path"},
+		{"s3 fallback", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DELETE /bucket/key"},
+		// REST-JSON operation-as-path (savingsplans): recover the op name.
+		{"restjson read op", mk("", "", "POST", "/DescribeSavingsPlans", "application/json"), "", "savingsplans", "DescribeSavingsPlans"},
+		{"restjson mutation op", mk("", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan"},
+		// S3 single CamelCase object key must NOT be read as an operation —
+		// it would forge a read verdict on a write.
+		{"s3 camelcase key not op", mk("", "", "PUT", "/DescribeThing", ""), "", "s3", "PUT /DescribeThing"},
+		// Lowercase / resource-path segments are not operation names.
+		{"lowercase segment not op", mk("", "", "POST", "/functions", "application/json"), "", "lambda", "POST /functions"},
+		{"versioned multi-segment not op", mk("", "", "POST", "/2013-04-01/hostedzone", ""), "", "route53", "POST /2013-04-01/hostedzone"},
 	}
 	for _, c := range cases {
-		if got := parseAction(c.req, []byte(c.body)); got != c.want {
+		if got := parseAction(c.req, []byte(c.body), c.service); got != c.want {
 			t.Errorf("%s: parseAction = %q, want %q", c.name, got, c.want)
 		}
 	}

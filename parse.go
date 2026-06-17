@@ -146,21 +146,32 @@ func parseAction(req *http.Request, body []byte, service string) string {
 	return req.Method + " " + req.URL.Path
 }
 
-// restJSONPathOperation recovers the operation name of an AWS REST-JSON
-// service (e.g. savingsplans) that encodes it as a single CamelCase path
-// segment: "POST /DescribeSavingsPlans" -> "DescribeSavingsPlans". Without
-// this such reads classify as "POST /<Op>", which matches no read prefix and
-// falls to the mutation/approval branch.
+// restJSONOperationServices is the allow-list of AWS services that use the
+// REST-JSON protocol with the operation name AS the request path
+// ("POST /DescribeSavingsPlans"). For these, and only these, the lone path
+// segment is a trustworthy operation name.
 //
-// It is deliberately narrow. S3 is excluded: its path segments are arbitrary
-// bucket/object keys that an attacker could name "DescribeFoo" to forge a
-// read verdict on a write — S3 reads are already allowed by HTTP method, not
-// action, so nothing is lost. The lone-CamelCase-segment shape is unique to
-// operation-as-path services; resource-path REST services (lambda, route53,
-// apigateway) use lowercase or versioned multi-segment paths and never match.
+// This is an allow-list on purpose. For every other service the request path
+// is a resource the agent controls — an S3 object key, an execute-api
+// customer route, a mediastore object key, a Lambda function name — which an
+// attacker could name "GetFoo" / "DeleteBar" to forge a read verdict on a
+// write. A deny-list (exclude S3 only) is fail-open: any service not thought
+// of is silently opted in. An allow-list is fail-closed: an unknown service
+// falls through to "METHOD path" and is gated as a mutation. Add a service
+// here only after confirming its wire path really is the operation name.
+var restJSONOperationServices = map[string]bool{
+	"savingsplans": true,
+}
+
+// restJSONPathOperation recovers the operation name of a REST-JSON
+// operation-as-path service (see restJSONOperationServices) from a lone
+// CamelCase path segment: "POST /DescribeSavingsPlans" ->
+// "DescribeSavingsPlans". Without it such reads classify as "POST /<Op>",
+// match no read prefix, and fall to the mutation/approval branch. Returns ""
+// for any other (or empty) service, and for multi-segment or non-CamelCase
+// paths.
 func restJSONPathOperation(service, path string) string {
-	switch service {
-	case "s3", "s3-control", "s3-outposts":
+	if !restJSONOperationServices[service] {
 		return ""
 	}
 	seg := strings.Trim(path, "/")

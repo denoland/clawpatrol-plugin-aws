@@ -72,13 +72,21 @@ func TestParseAction(t *testing.T) {
 		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "ec2", "POST /"},
 		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "lambda", "POST /path"},
 		{"s3 fallback", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DELETE /bucket/key"},
-		// REST-JSON operation-as-path (savingsplans): recover the op name.
+		// REST-JSON operation-as-path (savingsplans, allow-listed): recover op.
 		{"restjson read op", mk("", "", "POST", "/DescribeSavingsPlans", "application/json"), "", "savingsplans", "DescribeSavingsPlans"},
 		{"restjson mutation op", mk("", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan"},
-		// S3 single CamelCase object key must NOT be read as an operation —
-		// it would forge a read verdict on a write.
+		// Only a lone segment counts even for an allow-listed service.
+		{"savingsplans multi-segment", mk("", "", "POST", "/Foo/Bar", "application/json"), "", "savingsplans", "POST /Foo/Bar"},
+		{"savingsplans dot segment", mk("", "", "POST", "/../Foo", "application/json"), "", "savingsplans", "POST /../Foo"},
+		// Allow-list is fail-closed: non-allow-listed services whose path is an
+		// arbitrary, agent-controlled resource must NOT have a CamelCase
+		// segment read as an operation — that would forge a read verdict on a
+		// write and bypass the approval gate.
+		{"execute-api forged read not op", mk("", "", "DELETE", "/GetThing", "application/json"), "", "execute-api", "DELETE /GetThing"},
+		{"mediastore forged read not op", mk("", "", "DELETE", "/GetReport", ""), "", "mediastore", "DELETE /GetReport"},
 		{"s3 camelcase key not op", mk("", "", "PUT", "/DescribeThing", ""), "", "s3", "PUT /DescribeThing"},
-		// Lowercase / resource-path segments are not operation names.
+		{"empty service not op", mk("", "", "POST", "/GetThing", "application/json"), "", "", "POST /GetThing"},
+		// Resource-path services are also not allow-listed.
 		{"lowercase segment not op", mk("", "", "POST", "/functions", "application/json"), "", "lambda", "POST /functions"},
 		{"versioned multi-segment not op", mk("", "", "POST", "/2013-04-01/hostedzone", ""), "", "route53", "POST /2013-04-01/hostedzone"},
 	}

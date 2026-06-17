@@ -124,10 +124,15 @@ func isDigits(s string) bool {
 // in the form-encoded body for POST requests (ec2, iam, sts, autoscaling,
 // rds, cloudformation, sqs, sns, ...); REST-JSON services (savingsplans,
 // ...) name the operation as the request path ("POST /DescribeSavingsPlans");
-// otherwise it falls back to METHOD path (S3-style REST: "DELETE
-// /bucket/key"). body is the already-read request body; service is the
-// SigV4 signing name from the host.
+// S3 implies it from method + path + subresource (see s3Operation);
+// otherwise it falls back to METHOD path. body is the already-read request
+// body; service is the SigV4 signing name from the host.
 func parseAction(req *http.Request, body []byte, service string) string {
+	// S3 is REST: the operation is implied by method + path + subresource,
+	// never carried as X-Amz-Target / Action. Reconstruct the operation name.
+	if service == "s3" {
+		return s3Operation(req)
+	}
 	if t := req.Header.Get("X-Amz-Target"); t != "" {
 		if i := strings.LastIndex(t, "."); i >= 0 {
 			return t[i+1:]

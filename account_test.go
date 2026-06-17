@@ -6,23 +6,6 @@ import (
 	"testing"
 )
 
-func TestAccountName(t *testing.T) {
-	accts := []string{"820178564529=arnau-sandbox", " 035475582903 = denoland ", "malformed-no-eq"}
-	cases := []struct{ id, want string }{
-		{"820178564529", "arnau-sandbox"},
-		{"035475582903", "denoland"}, // surrounding spaces trimmed
-		{"000000000000", ""},
-	}
-	for _, c := range cases {
-		if got := accountName(accts, c.id); got != c.want {
-			t.Errorf("accountName(%q) = %q, want %q", c.id, got, c.want)
-		}
-	}
-	if got := accountName(nil, "820178564529"); got != "" {
-		t.Errorf("accountName(nil) = %q, want empty", got)
-	}
-}
-
 func TestApprovalSummary(t *testing.T) {
 	mk := func(method, path string) *http.Request {
 		return &http.Request{Method: method, URL: &url.URL{Path: path}}

@@ -71,7 +71,11 @@ func TestParseAction(t *testing.T) {
 		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "ec2", "DescribeVpcs"},
 		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "ec2", "POST /"},
 		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "lambda", "POST /path"},
-		{"s3 fallback", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DELETE /bucket/key"},
+		// S3 routes through s3Operation (covered in s3op_test.go); here we only
+		// confirm parseAction dispatches S3 to it instead of the METHOD-path
+		// fallback. A read-verby object key is still a write (PutObject), not a
+		// forged read.
+		{"s3 delete object", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DeleteObject"},
 		// REST-JSON operation-as-path (savingsplans, allow-listed): recover op.
 		{"restjson read op", mk("", "", "POST", "/DescribeSavingsPlans", "application/json"), "", "savingsplans", "DescribeSavingsPlans"},
 		{"restjson mutation op", mk("", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan"},
@@ -84,7 +88,7 @@ func TestParseAction(t *testing.T) {
 		// write and bypass the approval gate.
 		{"execute-api forged read not op", mk("", "", "DELETE", "/GetThing", "application/json"), "", "execute-api", "DELETE /GetThing"},
 		{"mediastore forged read not op", mk("", "", "DELETE", "/GetReport", ""), "", "mediastore", "DELETE /GetReport"},
-		{"s3 camelcase key not op", mk("", "", "PUT", "/DescribeThing", ""), "", "s3", "PUT /DescribeThing"},
+		{"s3 object put with read-verby key", mk("", "", "PUT", "/bucket/DescribeThing", ""), "", "s3", "PutObject"},
 		{"empty service not op", mk("", "", "POST", "/GetThing", "application/json"), "", "", "POST /GetThing"},
 		// Resource-path services are also not allow-listed.
 		{"lowercase segment not op", mk("", "", "POST", "/functions", "application/json"), "", "lambda", "POST /functions"},

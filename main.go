@@ -36,7 +36,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.1.3",
+		Version: "0.3.0",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -57,20 +57,41 @@ var awsFacet = pluginsdk.FacetDef{
 		{Name: "service", Kind: pluginsdk.FacetString, Label: "Service"},
 		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action"},
 		{Name: "account", Kind: pluginsdk.FacetString, Label: "Account"},
-		{Name: "account_name", Kind: pluginsdk.FacetString, Label: "Account name", Optional: true},
 		{Name: "region", Kind: pluginsdk.FacetString, Label: "Region", Optional: true},
 		{Name: "resource", Kind: pluginsdk.FacetString, Label: "Resource", Optional: true},
 		{Name: "method", Kind: pluginsdk.FacetString, Label: "Method", Optional: true},
+		// iam_action and account_name are deliberately NOT Optional. The
+		// gateway zero-fills omitted *optional* fields to "" (so rules need no
+		// has() guard); a non-optional field that the plugin omits instead
+		// stays absent, so a rule referencing it sees a CEL unknown and fails
+		// closed, while rules that don't reference it are unaffected. The
+		// plugin omits these two exactly when their value can't be trusted
+		// (iam_action undeterminable; account_name unresolvable from
+		// Organizations) — fail-closed is the wanted behavior there.
+		{Name: "iam_action", Kind: pluginsdk.FacetString, Label: "IAM action"},
+		{Name: "account_name", Kind: pluginsdk.FacetString, Label: "Account name"},
 	},
 }
 
-// awsAccountCredential holds the single base key (in the hub account) that
-// the endpoint uses to assume each member account's role.
+// awsAccountCredential holds a base key (in a hub account) that the endpoint
+// uses to assume each member account's role. More than one may be bound to an
+// endpoint: `accounts` tags which accounts a key serves, and a credential with
+// no `accounts` is the catch-all (see selectBaseKey). A single untagged
+// credential — the common case — serves every account.
 var awsAccountCredential = pluginsdk.CredentialDef{
 	TypeName: "aws_account",
-	Build: func(_ pluginsdk.BuildRequest) (any, error) {
+	Schema: pluginsdk.Schema{Fields: []pluginsdk.SchemaField{
+		// 12-digit account ids this key's role-assumption serves; empty = the
+		// fallback key for any account no other credential claims.
+		{Name: "accounts", TypeString: "list(string)"},
+	}},
+	Build: func(req pluginsdk.BuildRequest) (any, error) {
+		var cfg struct {
+			Accounts []string `json:"accounts"`
+		}
+		_ = json.Unmarshal(req.ConfigJSON, &cfg)
 		return pluginsdk.CredentialBuildResult{
-			Canonical: map[string]any{},
+			Canonical: map[string]any{"accounts": cfg.Accounts},
 			Metadata: pluginsdk.CredentialMetadata{
 				SecretSlots: []pluginsdk.SecretSlot{
 					{Name: "access_key_id", Label: "Base AWS access key ID"},
@@ -91,32 +112,13 @@ var awsAPIEndpoint = pluginsdk.EndpointDef{
 	Schema: pluginsdk.Schema{Fields: []pluginsdk.SchemaField{
 		{Name: "role", TypeString: "string", Required: true}, // role name assumed in each account
 		{Name: "region", TypeString: "string"},               // default STS/signing region
-		// accounts maps each 12-digit account id to a human label, as
-		// "<account-id>=<name>" entries, so rules can match
-		// aws.account_name and approval prompts read "in account dev"
-		// instead of a bare number. Operator-supplied; the plugin ships no
-		// account names of its own.
-		{Name: "accounts", TypeString: "list(string)"},
 	}},
 	HandleConn: handleAWS,
 }
 
 type endpointConfig struct {
-	Role     string   `json:"role"`
-	Region   string   `json:"region"`
-	Accounts []string `json:"accounts"`
-}
-
-// accountName returns the operator-configured label for accountID, or "".
-// The endpoint's `accounts` list carries "<account-id>=<name>" entries.
-func accountName(accounts []string, accountID string) string {
-	for _, e := range accounts {
-		id, name, ok := strings.Cut(e, "=")
-		if ok && strings.TrimSpace(id) == accountID {
-			return strings.TrimSpace(name)
-		}
-	}
-	return ""
+	Role   string `json:"role"`
+	Region string `json:"region"`
 }
 
 // maxRequestBody bounds how much of a request body the plugin buffers in
@@ -205,16 +207,41 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 				"(set the agent's access_key_id to encode the account, e.g. AKIA<account-id>0000)")
 	}
 
-	acctName := accountName(cfg.Accounts, account)
-	verdict, err := conn.Evaluate(ctx, "aws", map[string]any{
-		"service":      service,
-		"action":       action,
-		"account":      account,
-		"account_name": acctName,
-		"region":       region,
-		"resource":     req.URL.Path,
-		"method":       req.Method,
-	}, approvalSummary(req, service, action, region, account, acctName, host))
+	// The base key (in a hub account) assumes the target account's role and
+	// also drives Organizations account-name resolution, so it is needed
+	// before the policy evaluation. With several bound credentials it is the
+	// one whose `accounts` covers this account (else the fallback).
+	base, err := selectBaseKey(conn, account)
+	if err != nil {
+		return writeStatus(conn, http.StatusForbidden, "clawpatrol: "+err.Error())
+	}
+	if base.AccessKeyID == "" || base.SecretAccessKey == "" {
+		return fmt.Errorf("no base AWS credentials bound (need an aws_account credential)")
+	}
+
+	fields := map[string]any{
+		"service":  service,
+		"action":   action, // CloudTrail eventName, e.g. DeleteObject
+		"verb":     action, // drives the activity-log verb column
+		"account":  account,
+		"region":   region,
+		"resource": req.URL.Path,
+		"method":   req.Method,
+	}
+	if iam := iamAction(service, action); iam != "" {
+		fields["iam_action"] = iam // e.g. s3:DeleteObject, s3:ListBucket
+	}
+	// account_name comes from AWS Organizations. Omit it when it can't be
+	// resolved: a rule matching aws.account_name then evaluates to a CEL
+	// unknown and fails closed, while rules that don't reference it are
+	// unaffected.
+	acctName, known := org.accountName(ctx, conn, base, cfg.Role, account)
+	if known {
+		fields["account_name"] = acctName
+	}
+
+	verdict, err := conn.Evaluate(ctx, "aws", fields,
+		approvalSummary(req, service, action, region, account, acctName, host))
 	if err != nil {
 		return fmt.Errorf("evaluate: %w", err)
 	}
@@ -224,10 +251,6 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 
 	// Assume the per-account role with the base key, then sign with the
 	// temporary credentials.
-	base := baseKey(conn)
-	if base.AccessKeyID == "" || base.SecretAccessKey == "" {
-		return fmt.Errorf("no base AWS credentials bound (need an aws_account credential)")
-	}
 	creds, err := assumeRole(ctx, conn, base, account, cfg.Role, "clawpatrol-"+conn.Profile)
 	if err != nil {
 		return fmt.Errorf("assume role: %w", err)

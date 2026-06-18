@@ -112,8 +112,8 @@ github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa h1:h8TfIT1xc8FWbwwpmHn1J5i43Y0uZP97GqasGCzSRJk=
 github.com/dblohm7/wingoes v0.0.0-20240119213807-a09d6be7affa/go.mod h1:Nx87SkVqTKd8UtT+xu7sM/l+LgXs6c0aHrlKusR+2EQ=
-github.com/denoland/clawpatrol v0.2.13-0.20260617160449-0d5cb59ce2b6 h1:5jLXzqUSwhfdOxNnZkP3I1Nw4YnlbBZugiLbS6oZYOA=
-github.com/denoland/clawpatrol v0.2.13-0.20260617160449-0d5cb59ce2b6/go.mod h1:fk7cFdG8lzbGn8otzW18UKRfeSDOvuJBa+6vjl9pBVI=
+github.com/denoland/clawpatrol v0.3.0 h1:H+T+PZ3ED5CCZYKO+ipPEG0mQOZpBcbvlLUhC/EL1xE=
+github.com/denoland/clawpatrol v0.3.0/go.mod h1:fk7cFdG8lzbGn8otzW18UKRfeSDOvuJBa+6vjl9pBVI=
 github.com/digitorus/pkcs7 v0.0.0-20230713084857-e76b763bdc49/go.mod h1:SKVExuS+vpu2l9IoOc0RwqE7NYnb0JlcFHFnEJkVDzc=
 github.com/digitorus/pkcs7 v0.0.0-20230818184609-3a137a874352 h1:ge14PCmCvPjpMQMIAH7uKg0lrtNSOdpYsRXlwk3QbaE=
 github.com/digitorus/pkcs7 v0.0.0-20230818184609-3a137a874352/go.mod h1:SKVExuS+vpu2l9IoOc0RwqE7NYnb0JlcFHFnEJkVDzc=

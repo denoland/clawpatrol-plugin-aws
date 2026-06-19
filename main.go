@@ -38,7 +38,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.4",
+		Version: "0.3.5",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -58,9 +58,14 @@ var awsFacet = pluginsdk.FacetDef{
 	Fields: []pluginsdk.FacetField{
 		{Name: "service", Kind: pluginsdk.FacetString, Label: "Service", Description: "AWS service", DetailOnly: true},
 		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action", Description: "API action (CloudTrail)", DetailOnly: true},
-		{Name: "account", Kind: pluginsdk.FacetString, Label: "Account", Description: "AWS account ID"},
-		{Name: "region", Kind: pluginsdk.FacetString, Label: "Region", Description: "AWS region", Optional: true},
+		// Compact-row order is declaration order of the non-title,
+		// non-detail_only fields: resource, then account (account_name
+		// follows below). region is redundant with the host shown alongside,
+		// so it's detail-only — the row reads "<resource> · <account> ·
+		// <account_name>" rather than leading with the bare account id.
 		{Name: "resource", Kind: pluginsdk.FacetString, Label: "Resource", Description: "Resource ARN / key", Optional: true},
+		{Name: "account", Kind: pluginsdk.FacetString, Label: "Account", Description: "AWS account ID"},
+		{Name: "region", Kind: pluginsdk.FacetString, Label: "Region", Description: "AWS region", Optional: true, DetailOnly: true},
 		{Name: "method", Kind: pluginsdk.FacetString, Label: "Method", Description: "HTTP method", Optional: true, DetailOnly: true},
 		// iam_action and account_name are deliberately NOT Optional. The
 		// gateway zero-fills omitted *optional* fields to "" (so rules need no

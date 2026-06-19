@@ -25,6 +25,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +38,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.3",
+		Version: "0.3.4",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -54,12 +56,12 @@ func main() {
 var awsFacet = pluginsdk.FacetDef{
 	Name: "aws",
 	Fields: []pluginsdk.FacetField{
-		{Name: "service", Kind: pluginsdk.FacetString, Label: "Service"},
-		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action"},
-		{Name: "account", Kind: pluginsdk.FacetString, Label: "Account"},
-		{Name: "region", Kind: pluginsdk.FacetString, Label: "Region", Optional: true},
-		{Name: "resource", Kind: pluginsdk.FacetString, Label: "Resource", Optional: true},
-		{Name: "method", Kind: pluginsdk.FacetString, Label: "Method", Optional: true},
+		{Name: "service", Kind: pluginsdk.FacetString, Label: "Service", Description: "AWS service", DetailOnly: true},
+		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action", Description: "API action (CloudTrail)", DetailOnly: true},
+		{Name: "account", Kind: pluginsdk.FacetString, Label: "Account", Description: "AWS account ID"},
+		{Name: "region", Kind: pluginsdk.FacetString, Label: "Region", Description: "AWS region", Optional: true},
+		{Name: "resource", Kind: pluginsdk.FacetString, Label: "Resource", Description: "Resource ARN / key", Optional: true},
+		{Name: "method", Kind: pluginsdk.FacetString, Label: "Method", Description: "HTTP method", Optional: true, DetailOnly: true},
 		// iam_action and account_name are deliberately NOT Optional. The
 		// gateway zero-fills omitted *optional* fields to "" (so rules need no
 		// has() guard); a non-optional field that the plugin omits instead
@@ -68,8 +70,16 @@ var awsFacet = pluginsdk.FacetDef{
 		// plugin omits these two exactly when their value can't be trusted
 		// (iam_action undeterminable; account_name unresolvable from
 		// Organizations) — fail-closed is the wanted behavior there.
-		{Name: "iam_action", Kind: pluginsdk.FacetString, Label: "IAM action"},
-		{Name: "account_name", Kind: pluginsdk.FacetString, Label: "Account name"},
+		// iam_action is the Title: the activity-log verb is the IAM action
+		// (e.g. "s3:ListBucket"), not the bare HTTP method.
+		{Name: "iam_action", Kind: pluginsdk.FacetString, Label: "IAM action", Description: "IAM action — match with aws.iam_action", Title: true},
+		{Name: "account_name", Kind: pluginsdk.FacetString, Label: "Account name", Description: "Account name (Organizations)"},
+	},
+	// ResultFields is reported after the response via Conn.SetResult. status
+	// (the Title) becomes the action's status slot: the HTTP code on success,
+	// the AWS error code (e.g. "AccessDenied") on failure.
+	ResultFields: []pluginsdk.FacetField{
+		{Name: "status", Kind: pluginsdk.FacetString, Label: "Status", Description: "HTTP status, or AWS error code on failure", Title: true},
 	},
 }
 
@@ -272,6 +282,23 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 		return fmt.Errorf("read response: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// Report the outcome. On success the status is the HTTP code; on a 4xx/5xx
+	// the AWS error code (e.g. "AccessDenied") is far more useful, so buffer
+	// the error body to extract it, then restore it (re-framed to its length)
+	// so the agent still gets the response. AWS error bodies are small; the
+	// 256 KiB cap bounds memory, and an error body beyond it is forwarded
+	// truncated rather than buffered unbounded — a non-issue in practice.
+	status := strconv.Itoa(resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		resp.Body = io.NopCloser(bytes.NewReader(errBody))
+		resp.ContentLength = int64(len(errBody))
+		if code := awsErrorCode(resp.Header, errBody); code != "" {
+			status = code
+		}
+	}
+	_ = conn.SetResult(ctx, map[string]any{"status": status})
 	return resp.Write(conn)
 }
 
@@ -388,4 +415,40 @@ func writeStatus(conn *pluginsdk.Conn, code int, msg string) error {
 		ContentLength: int64(len(msg) + 1),
 	}
 	return resp.Write(conn)
+}
+
+var (
+	xmlErrCodeRe  = regexp.MustCompile(`<Code>([^<]+)</Code>`)
+	jsonErrTypeRe = regexp.MustCompile(`"__type"\s*:\s*"([^"]+)"`)
+	jsonErrCodeRe = regexp.MustCompile(`"[Cc]ode"\s*:\s*"([^"]+)"`)
+)
+
+// awsErrorCode pulls the AWS error code from an error response: the
+// x-amzn-errortype header (query / JSON APIs), the XML <Code> (S3, EC2,
+// query), or a JSON __type / code field. "" when none is found, so the
+// caller falls back to the HTTP status.
+func awsErrorCode(h http.Header, body []byte) string {
+	if et := h.Get("X-Amzn-Errortype"); et != "" {
+		// e.g. "AccessDeniedException:http://internal.amazon.com/...".
+		if i := strings.IndexByte(et, ':'); i > 0 {
+			et = et[:i]
+		}
+		return strings.TrimSpace(et)
+	}
+	s := string(body)
+	if m := xmlErrCodeRe.FindStringSubmatch(s); len(m) == 2 {
+		return m[1]
+	}
+	if m := jsonErrTypeRe.FindStringSubmatch(s); len(m) == 2 {
+		t := m[1]
+		// "...ServiceException#AccessDeniedException" -> "AccessDeniedException".
+		if i := strings.LastIndexByte(t, '#'); i >= 0 {
+			t = t[i+1:]
+		}
+		return t
+	}
+	if m := jsonErrCodeRe.FindStringSubmatch(s); len(m) == 2 {
+		return m[1]
+	}
+	return ""
 }

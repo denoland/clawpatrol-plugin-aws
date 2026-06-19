@@ -38,7 +38,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.5",
+		Version: "0.3.6",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -57,7 +57,11 @@ var awsFacet = pluginsdk.FacetDef{
 	Name: "aws",
 	Fields: []pluginsdk.FacetField{
 		{Name: "service", Kind: pluginsdk.FacetString, Label: "Service", Description: "AWS service", DetailOnly: true},
-		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action", Description: "API action (CloudTrail)", DetailOnly: true},
+		// action (the CloudTrail API action, e.g. "ListBuckets") is the Title:
+		// the activity-log verb. It reads more naturally than the IAM action
+		// (iam_action, "s3:ListBuckets"), which is kept detail-only below but
+		// stays matchable via aws.iam_action.
+		{Name: "action", Kind: pluginsdk.FacetString, Label: "Action", Description: "API action (CloudTrail)", Title: true},
 		// Compact-row order is declaration order of the non-title,
 		// non-detail_only fields: resource, then account (account_name
 		// follows below). region is redundant with the host shown alongside,
@@ -75,9 +79,7 @@ var awsFacet = pluginsdk.FacetDef{
 		// plugin omits these two exactly when their value can't be trusted
 		// (iam_action undeterminable; account_name unresolvable from
 		// Organizations) — fail-closed is the wanted behavior there.
-		// iam_action is the Title: the activity-log verb is the IAM action
-		// (e.g. "s3:ListBucket"), not the bare HTTP method.
-		{Name: "iam_action", Kind: pluginsdk.FacetString, Label: "IAM action", Description: "IAM action — match with aws.iam_action", Title: true},
+		{Name: "iam_action", Kind: pluginsdk.FacetString, Label: "IAM action", Description: "IAM action — match with aws.iam_action", DetailOnly: true},
 		{Name: "account_name", Kind: pluginsdk.FacetString, Label: "Account name", Description: "Account name (Organizations)"},
 	},
 	// ResultFields is reported after the response via Conn.SetResult. status

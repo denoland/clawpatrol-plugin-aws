@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
 	github.com/aws/aws-sdk-go-v2/service/organizations v1.51.10
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
-	github.com/denoland/clawpatrol v0.4.0
+	github.com/denoland/clawpatrol v0.5.0
 )
 
 require (

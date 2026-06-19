@@ -26,8 +26,8 @@ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/denoland/clawpatrol v0.4.0 h1:NMZGC5b9UdUZJ5Df87juk/r2zbpfcfFl4P6T/vJjHIQ=
-github.com/denoland/clawpatrol v0.4.0/go.mod h1:fk7cFdG8lzbGn8otzW18UKRfeSDOvuJBa+6vjl9pBVI=
+github.com/denoland/clawpatrol v0.5.0 h1:Q/sao993UJydI95+Bw4NnPDZt4EKrNTHKet73V0L1gg=
+github.com/denoland/clawpatrol v0.5.0/go.mod h1:fk7cFdG8lzbGn8otzW18UKRfeSDOvuJBa+6vjl9pBVI=
 github.com/fatih/color v1.13.0/go.mod h1:kLAiJbzzSOZDVNGyDpeOxJ47H46qBXwg5ILebYFFOfk=
 github.com/fatih/color v1.18.0 h1:S8gINlzdQ840/4pfAwic/ZE0djQEH3wM94VfqLTZcOM=
 github.com/fatih/color v1.18.0/go.mod h1:4FelSpRwEGDpQ12mAdzqdOukCy4u8WUtOY6lkT/6HfU=

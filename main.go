@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,7 +39,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.6",
+		Version: "0.3.7",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -87,6 +88,10 @@ var awsFacet = pluginsdk.FacetDef{
 	// the AWS error code (e.g. "AccessDenied") on failure.
 	ResultFields: []pluginsdk.FacetField{
 		{Name: "status", Kind: pluginsdk.FacetString, Label: "Status", Description: "HTTP status, or AWS error code on failure", Title: true},
+		// The response body, offered as a stream via Conn.SetResult. The plugin
+		// taps it non-blocking up to a generous prefix; the gateway pulls up to
+		// its own (smaller) cap and cancels. Never affects what the agent gets.
+		{Name: "response_body", Kind: pluginsdk.FacetStream, Label: "Response body", Description: "Response body (gateway-capped)"},
 	},
 }
 
@@ -305,8 +310,98 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 			status = code
 		}
 	}
-	_ = conn.SetResult(ctx, map[string]any{"status": status})
-	return resp.Write(conn)
+	// Tee the response body so the gateway can pull it as a stream while the
+	// agent still gets the complete, unchanged response. The tap is a
+	// non-blocking bounded buffer: resp.Write reads the body through a
+	// TeeReader into it (writes never block and never error the copy, so the
+	// agent is never held up by the gateway), and the gateway drains a reader
+	// over the same buffer up to its own cap, then cancels. Reading the body
+	// through the tee replaces resp.Body with a TeeReader; restore the original
+	// closer so resp.Write still closes the upstream body.
+	tap := newBodyTap(64 * 1024)
+	origBody := resp.Body
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.TeeReader(resp.Body, tap), origBody}
+	_ = conn.SetResult(ctx, map[string]any{
+		"status":        status,
+		"response_body": pluginsdk.Stream(tap.reader()),
+	})
+	err = resp.Write(conn)
+	// The body has been fully read (or write failed); signal EOF to the tap
+	// reader so the gateway's pull terminates.
+	tap.close()
+	return err
+}
+
+// bodyTap is a non-blocking, bounded, concurrency-safe tee target. Write
+// appends to an internal buffer up to cap bytes and silently drops the rest;
+// it never blocks and always reports the full length consumed, so it never
+// stalls or errors the body copy feeding the agent. A single reader (handed to
+// the gateway) drains the captured bytes and returns EOF once the buffer is
+// drained and the tap is closed. Write (filling, from resp.Write) and Read
+// (draining, from the gateway pull) run concurrently and are guarded by a
+// mutex plus a cond so the reader blocks for more data instead of busy-looping.
+type bodyTap struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    []byte
+	off    int  // read cursor into buf
+	cap    int  // max bytes to retain
+	closed bool // no more writes will arrive
+}
+
+func newBodyTap(capacity int) *bodyTap {
+	t := &bodyTap{cap: capacity}
+	t.cond = sync.NewCond(&t.mu)
+	return t
+}
+
+// Write captures up to cap bytes and drops the remainder. Always returns
+// (len(p), nil) so io.TeeReader's copy is never blocked or errored.
+func (t *bodyTap) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	if room := t.cap - len(t.buf); room > 0 {
+		n := len(p)
+		if n > room {
+			n = room
+		}
+		t.buf = append(t.buf, p[:n]...)
+		t.cond.Broadcast()
+	}
+	t.mu.Unlock()
+	return len(p), nil
+}
+
+// close marks the tap as done; a reader blocked for more data wakes and, once
+// it has drained the buffer, sees EOF.
+func (t *bodyTap) close() {
+	t.mu.Lock()
+	t.closed = true
+	t.cond.Broadcast()
+	t.mu.Unlock()
+}
+
+// reader returns an io.Reader over the captured bytes for the gateway. The
+// gateway cancelling (closing the reader mid-way) just stops the reads; it
+// never touches the Write side, so resp.Write to the agent is unaffected.
+func (t *bodyTap) reader() io.Reader { return &bodyTapReader{t: t} }
+
+type bodyTapReader struct{ t *bodyTap }
+
+func (r *bodyTapReader) Read(p []byte) (int, error) {
+	t := r.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for t.off >= len(t.buf) && !t.closed {
+		t.cond.Wait()
+	}
+	if n := copy(p, t.buf[t.off:]); n > 0 {
+		t.off += n
+		return n, nil
+	}
+	return 0, io.EOF
 }
 
 // expectsContinue reports whether the Expect header requests a 100-continue

@@ -285,8 +285,10 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 
 	// Report the outcome. On success the status is the HTTP code; on a 4xx/5xx
 	// the AWS error code (e.g. "AccessDenied") is far more useful, so buffer
-	// the (small) error body to extract it, then restore it so the agent
-	// still receives the full response unchanged.
+	// the error body to extract it, then restore it (re-framed to its length)
+	// so the agent still gets the response. AWS error bodies are small; the
+	// 256 KiB cap bounds memory, and an error body beyond it is forwarded
+	// truncated rather than buffered unbounded — a non-issue in practice.
 	status := strconv.Itoa(resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))

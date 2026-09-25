@@ -120,6 +120,15 @@ func TestParseAction(t *testing.T) {
 		{"savingsplans target decoy", mk("Foo.DescribeSavingsPlans", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan", false},
 		// A target that cannot name an AWS operation names nothing.
 		{"non-operation-shaped target", mk("foo-bar", "", "POST", "/", ""), "", "discovery", "POST /", false},
+		// ";" separates parameters at EC2, but net/url drops the segment that
+		// contains one — so a body the gate cannot see is a termination to
+		// EC2. Both separators are tokenized here.
+		{"semicolon separated action", mk("", "", "POST", "/", formCT), "Action=TerminateInstances;Version=2016-11-15", "ec2", "TerminateInstances", false},
+		{"semicolon hidden action with target decoy", mk("AmazonEC2.DescribeRegions", "", "POST", "/", formCT), "Action=TerminateInstances;Version=2016-11-15", "ec2", "", true},
+		{"semicolon second parameter", mk("", "", "POST", "/", formCT), "Version=2016-11-15;Action=TerminateInstances", "ec2", "TerminateInstances", false},
+		{"semicolon in url query", mk("", "Version=2016-11-15;Action=TerminateInstances", "POST", "/", ""), "", "ec2", "TerminateInstances", false},
+		{"percent-encoded action key", mk("", "", "POST", "/", formCT), "%41ction=TerminateInstances", "ec2", "TerminateInstances", false},
+		{"percent-encoded action value", mk("", "", "POST", "/", formCT), "Action=Terminate%49nstances", "ec2", "TerminateInstances", false},
 		// Too large to scan: no operation name at all, so it is gated as a
 		// mutation rather than trusted from the header.
 		{"oversized body ignores target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", "application/x-amz-json-1.0"), strings.Repeat("x", maxActionScanBody+1), "dynamodb", "POST /", false},

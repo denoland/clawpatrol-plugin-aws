@@ -184,10 +184,8 @@ const maxActionScanBody = 4 << 20
 // through to "METHOD path" and is gated as a mutation. Current SDKs call SQS
 // over the JSON protocol at "/".)
 //
-// The body is read as a form whatever the Content-Type says, because the
-// services that dispatch on it do the same: EC2 runs a form-encoded body sent
-// as application/json (verified on the wire), so gating on the header would
-// leave the decoy open.
+// The body and the URL query are read with queryActions, which tokenizes them
+// the way the services do rather than the way net/url does.
 //
 // Every value of a repeated Action counts, not just the first: services
 // disagree on which duplicate wins (on the wire, EC2 takes the last one in a
@@ -219,10 +217,10 @@ func actionCandidates(req *http.Request, body []byte) []string {
 		names = append(names, n)
 	}
 	add(targetOperation(req.Header.Get("X-Amz-Target")))
-	for _, a := range req.URL.Query()["Action"] {
+	for _, a := range queryActions(req.URL.RawQuery) {
 		add(a)
 	}
-	for _, a := range formActions(body) {
+	for _, a := range queryActions(string(body)) {
 		add(a)
 	}
 	return names
@@ -238,15 +236,50 @@ func targetOperation(target string) string {
 	return target
 }
 
-// formActions returns every value of the "Action" parameter in a form-encoded
-// request body. AWS query-protocol services POST
-// "Action=DescribeRegions&Version=..." as application/x-www-form-urlencoded,
-// but they parse that body whatever the Content-Type says, so this does too.
-// A malformed body still yields the pairs that did parse: the goal is to see
-// every Action AWS could see, not to validate the body.
-func formActions(body []byte) []string {
-	vals, _ := url.ParseQuery(string(body))
-	return vals["Action"]
+// queryActions returns every value of the "Action" parameter in a query-string
+// encoded text: a URL query, or the form-encoded body a query-protocol service
+// POSTs ("Action=DescribeRegions&Version=...").
+//
+// It tokenizes the text itself rather than calling url.ParseQuery, because the
+// plugin's tokenizer and the service's must not disagree about which
+// parameters exist — a parameter only one of them sees is exactly the gap a
+// decoy is paired with. Two disagreements are handled here:
+//
+//   - ";" separates parameters. EC2 splits on it (verified on the wire:
+//     "Version=2016-11-15;Action=X" dispatches X), while url.ParseQuery has
+//     dropped every ";"-bearing segment since Go 1.17 and reports an error
+//     the caller cannot act on. Left to ParseQuery, a body of
+//     "Action=TerminateInstances;Version=..." is invisible to the gate and a
+//     termination to EC2.
+//   - A segment that does not decode cleanly still counts, with whatever the
+//     raw text says. The goal is to see every Action the service could see,
+//     not to validate the request.
+//
+// The body is read this way whatever the Content-Type claims, because the
+// services that dispatch on it do the same: EC2 runs a form-encoded body sent
+// as application/json.
+func queryActions(raw string) []string {
+	var out []string
+	for raw != "" {
+		seg := raw
+		if i := strings.IndexAny(raw, "&;"); i >= 0 {
+			seg, raw = raw[:i], raw[i+1:]
+		} else {
+			raw = ""
+		}
+		key, val, _ := strings.Cut(seg, "=")
+		if k, err := url.QueryUnescape(key); err == nil {
+			key = k
+		}
+		if key != "Action" {
+			continue
+		}
+		if v, err := url.QueryUnescape(val); err == nil {
+			val = v
+		}
+		out = append(out, val)
+	}
+	return out
 }
 
 // restJSONOperationServices is the allow-list of AWS services that use the

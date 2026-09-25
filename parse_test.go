@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -62,40 +63,89 @@ func TestParseAction(t *testing.T) {
 		req     *http.Request
 		body    string
 		service string
-		want    string
+		want    string // "" together with wantErr: the request is refused
+		wantErr bool
 	}{
-		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", ""), "", "dynamodb", "PutItem"},
-		{"target no dot", mk("Discovery", "", "POST", "/", ""), "", "discovery", "Discovery"},
-		{"query action in url", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/", ""), "", "ec2", "DescribeInstances"},
-		{"query action in form body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Version=2016-11-15", "ec2", "DescribeRegions"},
-		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "ec2", "DescribeVpcs"},
-		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "ec2", "POST /"},
-		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "lambda", "POST /path"},
+		{"json target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", ""), "", "dynamodb", "PutItem", false},
+		{"target no dot", mk("Discovery", "", "POST", "/", ""), "", "discovery", "Discovery", false},
+		{"query action in url", mk("", "Action=DescribeInstances&Version=2016-11-15", "POST", "/", ""), "", "ec2", "DescribeInstances", false},
+		{"query action in form body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Version=2016-11-15", "ec2", "DescribeRegions", false},
+		{"form body charset suffix", mk("", "", "POST", "/", formCT+"; charset=utf-8"), "Action=DescribeVpcs", "ec2", "DescribeVpcs", false},
+		{"form body no action", mk("", "", "POST", "/", formCT), "Version=2016-11-15", "ec2", "POST /", false},
+		{"non-form body ignored", mk("", "", "POST", "/path", "application/json"), "Action=ShouldNotMatch", "lambda", "POST /path", false},
 		// S3 routes through s3Operation (covered in s3op_test.go); here we only
 		// confirm parseAction dispatches S3 to it instead of the METHOD-path
 		// fallback. A read-verby object key is still a write (PutObject), not a
 		// forged read.
-		{"s3 delete object", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DeleteObject"},
+		{"s3 delete object", mk("", "", "DELETE", "/bucket/key", ""), "", "s3", "DeleteObject", false},
 		// REST-JSON operation-as-path (savingsplans, allow-listed): recover op.
-		{"restjson read op", mk("", "", "POST", "/DescribeSavingsPlans", "application/json"), "", "savingsplans", "DescribeSavingsPlans"},
-		{"restjson mutation op", mk("", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan"},
+		{"restjson read op", mk("", "", "POST", "/DescribeSavingsPlans", "application/json"), "", "savingsplans", "DescribeSavingsPlans", false},
+		{"restjson mutation op", mk("", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan", false},
 		// Only a lone segment counts even for an allow-listed service.
-		{"savingsplans multi-segment", mk("", "", "POST", "/Foo/Bar", "application/json"), "", "savingsplans", "POST /Foo/Bar"},
-		{"savingsplans dot segment", mk("", "", "POST", "/../Foo", "application/json"), "", "savingsplans", "POST /../Foo"},
+		{"savingsplans multi-segment", mk("", "", "POST", "/Foo/Bar", "application/json"), "", "savingsplans", "POST /Foo/Bar", false},
+		{"savingsplans dot segment", mk("", "", "POST", "/../Foo", "application/json"), "", "savingsplans", "POST /../Foo", false},
 		// Allow-list is fail-closed: non-allow-listed services whose path is an
 		// arbitrary, agent-controlled resource must NOT have a CamelCase
 		// segment read as an operation — that would forge a read verdict on a
 		// write and bypass the approval gate.
-		{"execute-api forged read not op", mk("", "", "DELETE", "/GetThing", "application/json"), "", "execute-api", "DELETE /GetThing"},
-		{"mediastore forged read not op", mk("", "", "DELETE", "/GetReport", ""), "", "mediastore", "DELETE /GetReport"},
-		{"s3 object put with read-verby key", mk("", "", "PUT", "/bucket/DescribeThing", ""), "", "s3", "PutObject"},
-		{"empty service not op", mk("", "", "POST", "/GetThing", "application/json"), "", "", "POST /GetThing"},
+		{"execute-api forged read not op", mk("", "", "DELETE", "/GetThing", "application/json"), "", "execute-api", "DELETE /GetThing", false},
+		{"mediastore forged read not op", mk("", "", "DELETE", "/GetReport", ""), "", "mediastore", "DELETE /GetReport", false},
+		{"s3 object put with read-verby key", mk("", "", "PUT", "/bucket/DescribeThing", ""), "", "s3", "PutObject", false},
+		{"empty service not op", mk("", "", "POST", "/GetThing", "application/json"), "", "", "POST /GetThing", false},
 		// Resource-path services are also not allow-listed.
-		{"lowercase segment not op", mk("", "", "POST", "/functions", "application/json"), "", "lambda", "POST /functions"},
-		{"versioned multi-segment not op", mk("", "", "POST", "/2013-04-01/hostedzone", ""), "", "route53", "POST /2013-04-01/hostedzone"},
+		{"lowercase segment not op", mk("", "", "POST", "/functions", "application/json"), "", "lambda", "POST /functions", false},
+		{"versioned multi-segment not op", mk("", "", "POST", "/2013-04-01/hostedzone", ""), "", "route53", "POST /2013-04-01/hostedzone", false},
+		// Operation-name confusion: the agent writes the whole request, so a
+		// slot the service ignores is a decoy. EC2 ignores X-Amz-Target and
+		// runs the form body; ranking the header first would gate a
+		// termination as a read. Conflicting names are refused, not ranked.
+		{"target decoy over form body", mk("AmazonEC2.DescribeRegions", "", "POST", "/", formCT), "Action=TerminateInstances&Version=2016-11-15", "ec2", "", true},
+		// The body is read as a form whatever the Content-Type claims: EC2
+		// dispatches a form body sent as application/json just the same.
+		{"target decoy with json content type", mk("AmazonEC2.DescribeRegions", "", "POST", "/", "application/json"), "Action=TerminateInstances&Version=2016-11-15", "ec2", "", true},
+		{"form body action despite json content type", mk("", "", "POST", "/", "application/json"), "Action=TerminateInstances&Version=2016-11-15", "ec2", "TerminateInstances", false},
+		{"url decoy over form body", mk("", "Action=DescribeRegions", "POST", "/", formCT), "Action=TerminateInstances", "ec2", "", true},
+		{"url decoy over json target", mk("DynamoDB_20120810.DeleteItem", "Action=ListTables", "POST", "/", "application/x-amz-json-1.0"), "", "dynamodb", "", true},
+		// Duplicates disagree across services (EC2 runs the last in a body,
+		// IAM and STS the first), so both values count.
+		{"duplicate action in body", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Action=TerminateInstances", "ec2", "", true},
+		{"duplicate action in url", mk("", "Action=ListUsers&Action=DeleteUser", "POST", "/", ""), "", "iam", "", true},
+		{"duplicate action agreeing", mk("", "", "POST", "/", formCT), "Action=DescribeRegions&Action=DescribeRegions", "ec2", "DescribeRegions", false},
+		{"url and body action agreeing", mk("", "Action=DescribeRegions", "POST", "/", formCT), "Action=DescribeRegions", "ec2", "DescribeRegions", false},
+		// Off the service root the operation is the path; a name planted in
+		// the header, the query or the body must not rename it.
+		{"lambda invoke url decoy", mk("", "Action=ListFunctions", "POST", "/2015-03-31/functions/f/invocations", "application/json"), "", "lambda", "POST /2015-03-31/functions/f/invocations", false},
+		{"lambda invoke target decoy", mk("AWSLambda.ListFunctions", "", "POST", "/2015-03-31/functions/f/invocations", "application/json"), "", "lambda", "POST /2015-03-31/functions/f/invocations", false},
+		{"lambda invoke form-body decoy payload", mk("", "", "POST", "/2015-03-31/functions/f/invocations", formCT), "Action=ListFunctions", "lambda", "POST /2015-03-31/functions/f/invocations", false},
+		{"savingsplans target decoy", mk("Foo.DescribeSavingsPlans", "", "POST", "/CreateSavingsPlan", "application/json"), "", "savingsplans", "CreateSavingsPlan", false},
+		// A target that cannot name an AWS operation names nothing.
+		{"non-operation-shaped target", mk("foo-bar", "", "POST", "/", ""), "", "discovery", "POST /", false},
+		// ";" separates parameters at EC2, but net/url drops the segment that
+		// contains one — so a body the gate cannot see is a termination to
+		// EC2. Both separators are tokenized here.
+		{"semicolon separated action", mk("", "", "POST", "/", formCT), "Action=TerminateInstances;Version=2016-11-15", "ec2", "TerminateInstances", false},
+		{"semicolon hidden action with target decoy", mk("AmazonEC2.DescribeRegions", "", "POST", "/", formCT), "Action=TerminateInstances;Version=2016-11-15", "ec2", "", true},
+		{"semicolon second parameter", mk("", "", "POST", "/", formCT), "Version=2016-11-15;Action=TerminateInstances", "ec2", "TerminateInstances", false},
+		{"semicolon in url query", mk("", "Version=2016-11-15;Action=TerminateInstances", "POST", "/", ""), "", "ec2", "TerminateInstances", false},
+		{"percent-encoded action key", mk("", "", "POST", "/", formCT), "%41ction=TerminateInstances", "ec2", "TerminateInstances", false},
+		{"percent-encoded action value", mk("", "", "POST", "/", formCT), "Action=Terminate%49nstances", "ec2", "TerminateInstances", false},
+		// Too large to scan: no operation name at all, so it is gated as a
+		// mutation rather than trusted from the header.
+		{"oversized body ignores target", mk("DynamoDB_20120810.PutItem", "", "POST", "/", "application/x-amz-json-1.0"), strings.Repeat("x", maxActionScanBody+1), "dynamodb", "POST /", false},
 	}
 	for _, c := range cases {
-		if got := parseAction(c.req, []byte(c.body), c.service); got != c.want {
+		got, err := parseAction(c.req, []byte(c.body), c.service)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: parseAction = %q, want a refusal", c.name, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: parseAction refused unexpectedly: %v", c.name, err)
+			continue
+		}
+		if got != c.want {
 			t.Errorf("%s: parseAction = %q, want %q", c.name, got, c.want)
 		}
 	}

@@ -39,7 +39,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.7",
+		Version: "0.3.8",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -220,7 +220,14 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 		req.ContentLength = int64(len(body))
 	}
 
-	action := parseAction(req, body, service)
+	// A request that names more than one operation is refused outright: the
+	// agent controls every slot an operation name can travel in, so one that
+	// disagrees with another is an attempt to have the gate rule on a
+	// different operation than AWS runs. No legitimate client sends two.
+	action, err := parseAction(req, body, service)
+	if err != nil {
+		return writeStatus(conn, http.StatusForbidden, "clawpatrol: "+err.Error())
+	}
 	account := accountFromAuthorization(req.Header.Get("Authorization"))
 
 	if account == "" {

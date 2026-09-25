@@ -120,13 +120,30 @@ rule "mutations need approval" {
 - `X-Amz-Target` for JSON-protocol services
   (`DynamoDB_20120810.PutItem` → `PutItem`),
 - the `Action` parameter for query-protocol services
-  (`DescribeInstances`),
+  (`DescribeInstances`), in the URL query or the request body,
 - the request path for REST-JSON operation-as-path services
   (savingsplans: `POST /DescribeSavingsPlans` → `DescribeSavingsPlans`),
 - method + path + subresource for **S3**
   (`DELETE /bucket/key` → `DeleteObject`, `GET /bucket?versions` →
   `ListObjectVersions`), and
 - otherwise `METHOD path` as a last resort.
+
+These sources are **not ranked against each other**. The agent writes the
+whole request, so a slot the service ignores is not inert — it is a free
+decoy: EC2 ignores `X-Amz-Target` and runs the `Action` in the form body,
+so preferring the header would gate `TerminateInstances` as a read. A
+request that carries **two different operation names** — in the header,
+the query, the body, or as a repeated `Action` — is therefore **refused**
+(`403`) instead of classified by a guess. No legitimate client sends two.
+
+An operation name in the header, the query or the body is read only when
+the request addresses the service root (`/`), which every protocol that
+names its operation that way does. On any other path the operation is the
+path itself — an agent-controlled resource (a Lambda function name, an
+execute-api route) that must not be renameable by a planted `Action`.
+One consequence: the query protocol's legacy resource-path form (SQS
+queue-URL endpoints) falls through to `METHOD path` and is gated as a
+mutation; current SDKs call SQS over the JSON protocol at `/`.
 
 `aws.iam_action` is then derived from the service and operation
 (`s3` + `ListObjectsV2` → `s3:ListBucket`).

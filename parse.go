@@ -148,7 +148,7 @@ func parseAction(req *http.Request, body []byte, service string) (string, error)
 	if len(names) > 1 {
 		return "", fmt.Errorf("request carries conflicting operation names (%s); "+
 			"refusing rather than guessing which one AWS would run",
-			strings.Join(names, ", "))
+			describeOperationNames(names))
 	}
 	if len(names) == 1 {
 		return names[0], nil
@@ -168,9 +168,51 @@ func parseAction(req *http.Request, body []byte, service string) (string, error)
 // large bodies, never reaches here).
 const maxActionScanBody = 4 << 20
 
+// maxNamedOperations is how many operation names a refusal spells out, and
+// maxOperationNameChars how much of each one. Both the names and how many of
+// them a request carries are the agent's to choose: isOperationName bounds
+// their charset but not their size, and the refusal travels into the
+// gateway's action record, which is persisted verbatim.
+//
+// maxCollectedOperationNames is the matching bound on collection. Two
+// distinct names already refuse the request, so a cap above two cannot change
+// the verdict — it holds the distinctness scan below the quadratic a body
+// packed with thousands of distinct Action values would otherwise cost. One
+// slot above what a refusal spells out is kept, so the refusal can say it is
+// not naming them all.
+const (
+	maxNamedOperations         = 4
+	maxOperationNameChars      = 64
+	maxCollectedOperationNames = maxNamedOperations + 1
+)
+
+// describeOperationNames renders the operation names of a refused request for
+// the refusal text, clamped in both directions and marking what it leaves out.
+//
+// The clamp is applied here, never to the names themselves: two names that
+// differ only past maxOperationNameChars are two names, and clamping before
+// the distinctness check in actionCandidates would collapse them into one and
+// let the request through.
+func describeOperationNames(names []string) string {
+	shown := names
+	more := false
+	if len(shown) > maxNamedOperations {
+		shown, more = shown[:maxNamedOperations], true
+	}
+	parts := make([]string, 0, len(shown))
+	for _, n := range shown {
+		parts = append(parts, clamp(n, maxOperationNameChars))
+	}
+	out := strings.Join(parts, ", ")
+	if more {
+		out += ", …"
+	}
+	return out
+}
+
 // actionCandidates returns the distinct operation names req carries, in source
-// order, or nothing when the request names no operation and the caller should
-// fall back to the path.
+// order, up to maxCollectedOperationNames, or nothing when the request names
+// no operation and the caller should fall back to the path.
 //
 // A name counts only when the request addresses the service root ("/"). Every
 // protocol that names its operation in the headers, the query or the body
@@ -206,7 +248,7 @@ func actionCandidates(req *http.Request, body []byte) []string {
 	}
 	var names []string
 	add := func(n string) {
-		if !isOperationName(n) {
+		if len(names) >= maxCollectedOperationNames || !isOperationName(n) {
 			return
 		}
 		for _, have := range names {

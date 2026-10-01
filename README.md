@@ -136,6 +136,13 @@ request that carries **two different operation names** — in the header,
 the query, the body, or as a repeated `Action` — is therefore **refused**
 (`403`) instead of classified by a guess. No legitimate client sends two.
 
+The refusal is reported as a `deny` action, so an agent probing for a decoy
+slot is as visible on the dashboard as a request a rule denies. It carries
+no `aws.action` / `aws.iam_action`: no operation was determined, and the
+record must not read as an API call AWS never saw. The operation names a
+refusal spells out are clamped in length and count — the agent chooses
+them, and the reason is persisted verbatim.
+
 An operation name in the header, the query or the body is read only when
 the request addresses the service root (`/`), which every protocol that
 names its operation that way does. On any other path the operation is the

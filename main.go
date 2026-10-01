@@ -39,7 +39,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.8",
+		Version: "0.3.9",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
@@ -220,15 +220,17 @@ func handleAWS(ctx context.Context, conn *pluginsdk.Conn) error {
 		req.ContentLength = int64(len(body))
 	}
 
+	account := accountFromAuthorization(req.Header.Get("Authorization"))
+
 	// A request that names more than one operation is refused outright: the
 	// agent controls every slot an operation name can travel in, so one that
 	// disagrees with another is an attempt to have the gate rule on a
 	// different operation than AWS runs. No legitimate client sends two.
 	action, err := parseAction(req, body, service)
 	if err != nil {
-		return writeStatus(conn, http.StatusForbidden, "clawpatrol: "+err.Error())
+		return refuse(conn, http.StatusForbidden,
+			refusalEvent(req, service, region, account, host, err.Error()))
 	}
-	account := accountFromAuthorization(req.Header.Get("Authorization"))
 
 	if account == "" {
 		return writeStatus(conn, http.StatusForbidden,
@@ -511,6 +513,83 @@ func baseKey(conn *pluginsdk.Conn) aws.Credentials {
 		SecretAccessKey: ex["secret_access_key"],
 		SessionToken:    ex["session_token"],
 	}
+}
+
+// refuse reports a refusal the plugin reached on its own and then answers the
+// agent with code — the order and shape the gateway uses for its own
+// brokered-dial refusals (handleDialRequest's refuse).
+//
+// Every action record the dashboard holds for this endpoint is derived from a
+// Conn.Evaluate, so a request turned away before the evaluation runs leaves no
+// record at all unless the plugin files one, and an agent probing for a decoy
+// slot is exactly the request an operator has to see.
+//
+// The status write is this function's only return and Conn.Emit neither waits
+// on a verdict nor reports an error, so no path reaches the agent with the
+// refusal unreported or the report unrefused. Ordering buys no more than that:
+// the event and the response bytes are serialized onto the same gateway
+// stream, so neither is deliverable when the other is not. The event goes
+// first so the record is in hand before the refusal is on the wire.
+func refuse(conn *pluginsdk.Conn, code int, ev pluginsdk.ConnEvent) error {
+	conn.Emit(ev)
+	return writeStatus(conn, code, "clawpatrol: "+ev.Reason)
+}
+
+// refusalEvent is the deny action for a request refused before its operation
+// could be determined.
+//
+// It is a deny rather than an error: the request was turned away, which is
+// what an operator reads off the dashboard, and what the gateway itself files
+// for the refusals it owns. Rule is empty because no rule produced the
+// verdict — Conn.Emit's bar is that an action must not claim a verdict a rule
+// did not reach, and claiming an allow is the fabrication that bar exists for.
+//
+// The facets carry only what the host and the request line already said;
+// action and iam_action stay absent, because no operation was determined and a
+// record naming one would read in the audit trail as a real API call that AWS
+// never saw.
+//
+// Every value is clamped. The gateway persists this record verbatim and
+// http.ReadRequest bounds neither the method nor the host the service and
+// region are read off, so each is as long as the agent cares to make it.
+// Clamping is safe precisely because a refused request is never evaluated:
+// these values are read by operators, never matched by a rule. reason is
+// bounded at its source instead (see describeOperationNames).
+func refusalEvent(req *http.Request, service, region, account, host, reason string) pluginsdk.ConnEvent {
+	method := clamp(req.Method, maxAuditField)
+	facets := map[string]any{
+		"service":  clamp(service, maxAuditField),
+		"region":   clamp(region, maxAuditField),
+		"resource": clamp(req.URL.Path, maxAuditField),
+		"method":   method,
+	}
+	if account != "" {
+		facets["account"] = account // a 12-digit run; bounded by construction
+	}
+	return pluginsdk.ConnEvent{
+		Action:  "deny",
+		Reason:  reason,
+		Verb:    method,
+		Summary: clamp(approvalSummary(req, service, "", region, account, "", host), maxAuditSummary),
+		Facets:  facets,
+	}
+}
+
+// maxAuditField bounds one agent-written value in an action record;
+// maxAuditSummary the one-line description built from several of them.
+const (
+	maxAuditField   = 128
+	maxAuditSummary = 512
+)
+
+// clamp cuts s to n bytes, marking that it did. The marker is outside the
+// charset of everything clamped here (an operation name, a host label, an HTTP
+// method), so a clamped value is never mistaken for a short one.
+func clamp(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func writeStatus(conn *pluginsdk.Conn, code int, msg string) error {

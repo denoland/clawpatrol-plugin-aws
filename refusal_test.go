@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/denoland/clawpatrol/pluginsdk"
 )
@@ -212,6 +213,35 @@ func TestRefusalEventClampsAgentWrittenFields(t *testing.T) {
 		if len(s) > maxAuditField+len("…") {
 			t.Errorf("Facets[%q] is %d bytes, want at most %d", field, len(s), maxAuditField+len("…"))
 		}
+	}
+}
+
+// TestRefusalEventKeepsClampedValuesValidUTF8 drives multi-byte runes through
+// the clamp. The resource and the summary built around it carry whatever the
+// agent wrote in the request line, and the gateway marshals the record to JSON,
+// so a cut landing inside a rune would leave a byte for it to coerce.
+func TestRefusalEventKeepsClampedValuesValidUTF8(t *testing.T) {
+	// A 3-byte rune repeated past every bound, so a cut at any byte offset
+	// divisible by neither 3 nor the bound lands mid-rune unless clamp backs up.
+	huge := strings.Repeat("é€世", 4096)
+	req := &http.Request{Method: "POST", Header: http.Header{}, URL: &url.URL{Path: "/" + huge}}
+	ev := refusalEvent(req, "ec2", "us-east-1", "035475582903", huge+".amazonaws.com", "refused")
+
+	vals := map[string]string{"Summary": ev.Summary, "Verb": ev.Verb}
+	for field, v := range ev.Facets {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("Facets[%q] = %v, want a string", field, v)
+		}
+		vals["Facets["+field+"]"] = s
+	}
+	for field, s := range vals {
+		if !utf8.ValidString(s) {
+			t.Errorf("%s = %q is not valid UTF-8; the clamp cut inside a rune", field, s)
+		}
+	}
+	if !strings.HasSuffix(ev.Facets["resource"].(string), "…") {
+		t.Errorf("resource = %q, want a clamp marker", ev.Facets["resource"])
 	}
 }
 

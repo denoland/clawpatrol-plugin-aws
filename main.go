@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -582,14 +583,22 @@ const (
 	maxAuditSummary = 512
 )
 
-// clamp cuts s to n bytes, marking that it did. The marker is outside the
-// charset of everything clamped here (an operation name, a host label, an HTTP
-// method), so a clamped value is never mistaken for a short one.
+// clamp cuts s to at most n bytes, marking that it did.
+//
+// The cut lands on a rune boundary. An operation name and a host label are
+// ASCII by construction, but a resource and the summary built around it carry
+// whatever the agent wrote in the request line, so a plain byte cut would hand
+// the gateway a partial rune to coerce. The marker is outside the charset of
+// the values that are ASCII, so a clamped one of those never reads as a short
+// one.
 func clamp(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "…"
+	if len(s) <= n {
+		return s
 	}
-	return s
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 func writeStatus(conn *pluginsdk.Conn, code int, msg string) error {

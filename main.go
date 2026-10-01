@@ -40,7 +40,7 @@ import (
 func main() {
 	pluginsdk.Run(&pluginsdk.Plugin{
 		Name:    "aws",
-		Version: "0.3.9",
+		Version: "0.3.10",
 		// No network of its own: every upstream connection — the API call
 		// and the STS AssumeRole — is the gateway's audited brokered dial.
 		Capabilities: pluginsdk.Capabilities{
